@@ -45,6 +45,21 @@ def _send_readings(client, device_id, points):
     return client.post("/api/v1/readings", json={"readings": readings})
 
 
+def _iso(minutes: float) -> str:
+    return (BASE + timedelta(minutes=minutes)).isoformat()
+
+
+def _post_windows(client, windows):
+    """windows: [(device_id, 起始分钟, 结束分钟)] 或 [(device_id, 起始分钟, 结束分钟, 备注)]"""
+    items = []
+    for w in windows:
+        item = {"device_id": w[0], "start": _iso(w[1]), "end": _iso(w[2])}
+        if len(w) > 3:
+            item["note"] = w[3]
+        items.append(item)
+    return client.post("/api/v1/outage-windows", json={"windows": items})
+
+
 class TestRuleApi:
     def test_put_and_get_rule(self, client):
         resp = _put_rule(client, "truck-01")
@@ -280,3 +295,217 @@ class TestRuleVersions:
         assert len(events) == 1
         assert events[0]["rule_version"] == 2
 
+
+
+class TestOutageWindowApi:
+    def test_batch_create_merges_overlapping_windows(self, client):
+        resp = _post_windows(client, [
+            ("truck-01", 0, 20),
+            ("truck-01", 10, 30),      # 重叠 → 合并为 [0,30)
+            ("truck-02", 0, 15),       # 不同设备不合并
+        ])
+        assert resp.status_code == 201
+        body = resp.json()
+        rows = [(w["device_id"], w["start"][11:16], w["end"][11:16]) for w in body]
+        assert rows == [
+            ("truck-01", "00:00", "00:30"),
+            ("truck-02", "00:00", "00:15"),
+        ]
+        # 落库后同样是合并后的两条
+        stored = client.get("/api/v1/outage-windows").json()
+        assert len(stored) == 2
+
+    def test_touching_windows_merge_half_open(self, client):
+        # 半开区间首尾相接 [0,10) + [10,20) → [0,20)
+        resp = _post_windows(client, [
+            ("truck-01", 10, 20),
+            ("truck-01", 0, 10),
+        ])
+        assert resp.status_code == 201
+        body = resp.json()
+        assert len(body) == 1
+        assert body[0]["start"].startswith("2026-01-01T00:00")
+        assert body[0]["end"].startswith("2026-01-01T00:20")
+
+    def test_merge_with_persisted_windows_on_later_batch(self, client):
+        _post_windows(client, [("truck-01", 0, 10), ("truck-01", 30, 40)])
+        # 第二批与两条既有窗口首尾相接，全部并为 [0,40)
+        resp = _post_windows(client, [("truck-01", 10, 30)])
+        body = resp.json()
+        assert len(body) == 1
+        assert body[0]["start"].startswith("2026-01-01T00:00")
+        assert body[0]["end"].startswith("2026-01-01T00:40")
+
+    def test_merge_cascades_beyond_batch_envelope(self, client):
+        # 既有窗口在批量区间外侧逐级首尾相接，需要定点扩展全部并为一条
+        _post_windows(client, [
+            ("truck-01", 0, 10),
+            ("truck-01", 20, 30),
+            ("truck-01", 30, 40),
+        ])
+        resp = _post_windows(client, [("truck-01", 10, 20)])
+        body = resp.json()
+        assert len(body) == 1
+        assert body[0]["start"].startswith("2026-01-01T00:00")
+        assert body[0]["end"].startswith("2026-01-01T00:40")
+
+    def test_disjoint_windows_remain_separate(self, client):
+        _post_windows(client, [("truck-01", 0, 10), ("truck-01", 20, 30)])
+        rows = client.get("/api/v1/devices/truck-01/outage-windows").json()
+        assert len(rows) == 2
+
+    def test_invalid_window_range_rejected(self, client):
+        resp = client.post("/api/v1/outage-windows", json={
+            "windows": [
+                {"device_id": "truck-01", "start": _iso(30), "end": _iso(10)},
+            ]
+        })
+        assert resp.status_code == 422
+
+    def test_time_range_query_half_open_overlap(self, client):
+        _post_windows(client, [
+            ("truck-01", 0, 10),
+            ("truck-01", 20, 30),
+            ("truck-01", 40, 50),
+        ])
+        # 查询 [20,40)：命中 [20,30)；[0,10) 不相交；[40,50) 首尾相接不算相交
+        rows = client.get(
+            "/api/v1/outage-windows",
+            params={"start": _iso(20), "end": _iso(40)},
+        ).json()
+        assert len(rows) == 1
+        assert rows[0]["start"].startswith("2026-01-01T00:20")
+
+    def test_device_scoped_query(self, client):
+        _post_windows(client, [
+            ("truck-01", 0, 10),
+            ("truck-02", 0, 20),
+        ])
+        rows = client.get(
+            "/api/v1/devices/truck-02/outage-windows"
+        ).json()
+        assert len(rows) == 1
+        assert rows[0]["device_id"] == "truck-02"
+
+    def test_naive_window_time_treated_as_utc(self, client):
+        resp = client.post("/api/v1/outage-windows", json={"windows": [
+            {"device_id": "truck-01",
+             "start": "2026-01-01T00:00:00",
+             "end": "2026-01-01T00:10:00+00:00"},
+        ]})
+        assert resp.status_code == 201
+        start = resp.json()[0]["start"]
+        assert start.startswith("2026-01-01T00:00:00")
+        assert start.endswith(("Z", "+00:00"))
+
+
+class TestOutageWindowEvents:
+    def test_window_excludes_readings_and_splits_events(self, client):
+        _put_rule(client, "truck-01")
+        _post_windows(client, [("truck-01", 15, 30)])
+        _send_readings(client, "truck-01", [
+            (0, 9.0),     # 超限
+            (10, 9.5),    # 窗口前最后读数
+            (20, 99.0),   # 窗口内：不参与判定
+            (30, 9.0),    # 窗口结束（end 不含）：首条超限开启新事件
+            (40, 5.0),
+        ])
+        events = client.get("/api/v1/devices/truck-01/events").json()
+        assert len(events) == 2
+        assert events[0]["end_time"].startswith("2026-01-01T00:10")
+        assert events[0]["ongoing"] is True
+        assert events[0]["violation_seconds"] == 600
+        assert events[1]["start_time"].startswith("2026-01-01T00:30")
+        assert events[1]["end_time"].startswith("2026-01-01T00:40")
+
+    def test_window_boundary_clears_recovery_tolerance(self, client):
+        _put_rule(client, "truck-01")  # tolerance 5 分钟
+        _post_windows(client, [("truck-01", 11, 14)])
+        _send_readings(client, "truck-01", [
+            (0, 9.0),
+            (10, 5.0),    # 恢复 2 分钟后进入窗口
+            (12, 5.0),    # 窗口内
+            (15, 9.0),    # 窗口后再超限：不得与窗口前事件合并
+            (20, 5.0),
+        ])
+        events = client.get("/api/v1/devices/truck-01/events").json()
+        assert len(events) == 2
+        assert events[0]["end_time"].startswith("2026-01-01T00:10")
+        assert events[1]["start_time"].startswith("2026-01-01T00:15")
+
+    def test_boundary_times_are_respected_half_open(self, client):
+        _put_rule(client, "truck-01")
+        _post_windows(client, [("truck-01", 10, 20)])
+        _send_readings(client, "truck-01", [
+            (10, 99.0),   # == start：窗口内，忽略
+            (20, 9.0),    # == end：窗口外，参与判定，开启事件
+            (30, 5.0),
+        ])
+        events = client.get("/api/v1/devices/truck-01/events").json()
+        assert len(events) == 1
+        assert events[0]["start_time"].startswith("2026-01-01T00:20")
+
+    def test_window_inside_otherwise_normal_period_yields_no_event(self, client):
+        _put_rule(client, "truck-01")
+        _post_windows(client, [("truck-01", 10, 30)])
+        _send_readings(client, "truck-01", [
+            (0, 5.0),
+            (10, 99.0), (20, 99.0),   # 窗口内的极端读数全部忽略
+            (30, 5.0),
+        ])
+        assert client.get("/api/v1/devices/truck-01/events").json() == []
+
+    def test_all_devices_events_apply_same_window_logic(self, client):
+        _put_rule(client, "truck-01")
+        _put_rule(client, "truck-02")
+        _post_windows(client, [
+            ("truck-01", 15, 30),
+            ("truck-02", 15, 30),
+        ])
+        points = [
+            (0, 9.0),
+            (10, 9.5),
+            (20, 99.0),   # 窗口内
+            (30, 9.0),
+            (40, 5.0),
+        ]
+        _send_readings(client, "truck-01", points)
+        _send_readings(client, "truck-02", points)
+        events = client.get("/api/v1/events").json()
+        # 与单设备接口相同逻辑：每台设备 2 个事件
+        assert len(events) == 4
+        per_device = {
+            d: [e for e in events if e["device_id"] == d]
+            for d in ("truck-01", "truck-02")
+        }
+        for device_events in per_device.values():
+            assert len(device_events) == 2
+
+    def test_delete_device_removes_its_windows(self, client):
+        _put_rule(client, "truck-01")
+        _post_windows(client, [("truck-01", 0, 10)])
+        assert client.delete("/api/v1/devices/truck-01").status_code == 200
+        rows = client.get("/api/v1/outage-windows").json()
+        assert rows == []
+
+    def test_window_for_unknown_device_does_not_create_device(self, client):
+        # 停运窗口可独立于规则配置；但未配置规则的设备仍不出现在 /devices
+        _post_windows(client, [("ghost", 0, 10)])
+        assert client.get("/api/v1/devices").json() == []
+
+    def test_event_time_range_filter_still_works_with_windows(self, client):
+        _put_rule(client, "truck-01")
+        _post_windows(client, [("truck-01", 15, 30)])
+        _send_readings(client, "truck-01", [
+            (0, 9.0),
+            (10, 5.0),
+            (20, 99.0),   # 窗口内
+            (40, 9.0),
+            (50, 5.0),
+        ])
+        events = client.get(
+            "/api/v1/devices/truck-01/events",
+            params={"start": _iso(35), "end": _iso(60)},
+        ).json()
+        assert len(events) == 1
+        assert events[0]["start_time"].startswith("2026-01-01T00:40")

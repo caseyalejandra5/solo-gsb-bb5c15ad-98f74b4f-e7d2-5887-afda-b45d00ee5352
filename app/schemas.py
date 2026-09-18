@@ -109,3 +109,36 @@ class EventOut(BaseModel):
     max_temp: float
     min_temp: float
     reading_count: int
+
+
+class OutageWindowIn(BaseModel):
+    """批量创建请求中的单个计划停运窗口（UTC 半开区间 [start, end)）。"""
+
+    device_id: str = Field(..., min_length=1)
+    start: datetime = Field(..., description="窗口开始时间（含），ISO 8601，无时区按 UTC")
+    end: datetime = Field(..., description="窗口结束时间（不含），ISO 8601，无时区按 UTC")
+    note: str = Field("", description="备注（可选）")
+
+    @field_validator("start", "end")
+    @classmethod
+    def _normalize_ts(cls, v: datetime) -> datetime:
+        return to_utc(v)
+
+    @model_validator(mode="after")
+    def _check_range(self):
+        if self.start >= self.end:
+            raise ValueError("停运窗口要求 start < end（半开区间 [start, end)）")
+        return self
+
+
+class OutageWindowBatchIn(BaseModel):
+    windows: list[OutageWindowIn] = Field(..., min_length=1, max_length=10000)
+
+
+class OutageWindowOut(BaseModel):
+    id: int
+    device_id: str
+    start: datetime = Field(..., description="窗口开始时间（含，UTC）")
+    end: datetime = Field(..., description="窗口结束时间（不含，UTC）")
+    note: str
+    created_at: datetime

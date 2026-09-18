@@ -2,7 +2,17 @@
 
 from datetime import datetime, timedelta, timezone
 
-from app.events import Reading, Rule, RuleVersion, detect_events, detect_versioned_events
+import pytest
+
+from app.events import (
+    OutageWindow,
+    Reading,
+    Rule,
+    RuleVersion,
+    detect_events,
+    detect_versioned_events,
+    merge_windows,
+)
 
 BASE = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 # 上限 8℃、下限 2℃、容忍 5 分钟、最大间隔 30 分钟
@@ -247,3 +257,152 @@ class TestVersionedEvents:
 
     def test_no_versions_no_events(self):
         assert detect_versioned_events([r(0, 9.0)], []) == []
+
+
+class TestWindowMerging:
+    def w(self, start_min: float, end_min: float) -> OutageWindow:
+        return OutageWindow(
+            start=BASE + timedelta(minutes=start_min),
+            end=BASE + timedelta(minutes=end_min),
+        )
+
+    def test_overlapping_windows_merge(self):
+        merged = merge_windows([self.w(10, 20), self.w(15, 25)])
+        assert merged == [self.w(10, 25)]
+
+    def test_touching_half_open_windows_merge(self):
+        # 半开区间首尾相接：[0,10) 与 [10,20) 合并
+        merged = merge_windows([self.w(10, 20), self.w(0, 10)])
+        assert merged == [self.w(0, 20)]
+
+    def test_disjoint_windows_stay_separated(self):
+        merged = merge_windows([self.w(0, 10), self.w(20, 30)])
+        assert merged == [self.w(0, 10), self.w(20, 30)]
+
+    def test_contained_window_is_absorbed(self):
+        merged = merge_windows([self.w(0, 30), self.w(10, 20)])
+        assert merged == [self.w(0, 30)]
+
+    def test_empty_input(self):
+        assert merge_windows([]) == []
+
+    def test_start_must_be_before_end(self):
+        with pytest.raises(ValueError):
+            OutageWindow(start=BASE + timedelta(minutes=10),
+                         end=BASE + timedelta(minutes=10))
+        with pytest.raises(ValueError):
+            OutageWindow(start=BASE + timedelta(minutes=11),
+                         end=BASE + timedelta(minutes=10))
+
+
+class TestOutageWindowEvents:
+    def w(self, start_min: float, end_min: float) -> OutageWindow:
+        return OutageWindow(
+            start=BASE + timedelta(minutes=start_min),
+            end=BASE + timedelta(minutes=end_min),
+        )
+
+    def test_readings_inside_window_are_ignored(self):
+        # 窗口内的读数即使超限也不产生事件
+        events = detect_versioned_events([
+            r(0, 5.0),
+            r(10, 9.0),    # 窗口内（start 含）
+            r(20, 99.0),   # 窗口内
+            r(30, 5.0),
+        ], [rv(1, -1000)], [self.w(10, 30)])
+        assert events == []
+
+    def test_window_boundary_closes_event_and_violations_do_not_merge(self):
+        # 窗口前持续超限、窗口后立刻又超限：边界必须闭合旧事件且禁止合并
+        events = detect_versioned_events([
+            r(0, 9.0),
+            r(10, 9.5),   # 窗口前最后一条，仍超限
+            r(20, 99.0),  # 窗口内：忽略
+            r(30, 9.2),   # 窗口结束后首条（end 不含）：超限开启新事件
+            r(40, 5.0),
+        ], [rv(1, -1000)], [self.w(15, 30)])
+        assert len(events) == 2
+        old, new = events
+        # 旧事件在窗口边界闭合：无后续恢复读数 → ongoing
+        assert old["start_time"] == BASE + timedelta(minutes=0)
+        assert old["end_time"] == BASE + timedelta(minutes=10)
+        assert old["ongoing"] is True
+        # 10→20 跨越窗口边界，不计入任何一侧
+        assert old["violation_seconds"] == 10 * 60
+        assert new["start_time"] == BASE + timedelta(minutes=30)
+        assert new["end_time"] == BASE + timedelta(minutes=40)
+        assert new["ongoing"] is False
+        assert new["violation_seconds"] == 10 * 60
+
+    def test_window_clears_tolerance_state(self):
+        # 窗口前短暂恢复 2 分钟（< 容忍 5 分钟），窗口后再超限也不得合并
+        events = detect_versioned_events([
+            r(0, 9.0),
+            r(10, 5.0),    # 恢复（窗口前）
+            r(12, 5.0),    # 窗口内：忽略，恢复/容忍状态在此清空
+            r(15, 9.0),    # 窗口结束后首条：超限开启新事件
+            r(20, 5.0),
+        ], [rv(1, -1000)], [self.w(11, 14)])
+        assert len(events) == 2
+        assert events[0]["start_time"] == BASE
+        assert events[0]["end_time"] == BASE + timedelta(minutes=10)
+        assert events[1]["start_time"] == BASE + timedelta(minutes=15)
+
+    def test_no_merge_even_without_gap_across_window(self):
+        # 窗口两侧读数只相隔 3 分钟（< max_gap 30 分钟），窗口仍强制分段
+        events = detect_versioned_events([
+            r(10, 9.0),
+            r(12, 9.0),   # 窗口内忽略
+            r(13, 9.0),
+            r(20, 5.0),
+        ], [rv(1, -1000)], [self.w(11, 13)])
+        assert len(events) == 2
+        assert events[0]["start_time"] == BASE + timedelta(minutes=10)
+        assert events[1]["start_time"] == BASE + timedelta(minutes=13)
+
+    def test_half_open_boundary_times(self):
+        # start 时刻属于窗口（忽略）；end 时刻不属于窗口（参与判定）
+        events = detect_versioned_events([
+            r(10, 99.0),   # == window.start：窗口内，忽略
+            r(20, 9.0),    # == window.end：窗口外，超限开启事件
+            r(30, 5.0),
+        ], [rv(1, -1000)], [self.w(10, 20)])
+        assert len(events) == 1
+        assert events[0]["start_time"] == BASE + timedelta(minutes=20)
+
+    def test_multiple_windows_split_into_separate_events(self):
+        events = detect_versioned_events([
+            r(0, 9.0),
+            r(10, 5.0),    # 第一个事件恢复
+            r(20, 99.0),   # 窗口 1 内，忽略
+            r(30, 9.0),    # 窗口 1 后再超限（与窗口 2 之间）
+            r(35, 5.0),
+            r(40, 99.0),   # 窗口 2 内，忽略
+            r(50, 9.0),    # 窗口 2 后再超限
+            r(60, 5.0),
+        ], [rv(1, -1000)], [self.w(15, 45), self.w(20, 25)])
+        # 合并后实际窗口为 [15,45)：20/40 的读数都在窗口内
+        assert len(events) == 2
+        assert events[0]["start_time"] == BASE
+        assert events[1]["start_time"] == BASE + timedelta(minutes=50)
+
+    def test_window_with_violations_only_inside_yields_no_event(self):
+        events = detect_versioned_events([
+            r(10, 9.0),
+            r(20, 9.5),
+        ], [rv(1, -1000)], [self.w(0, 30)])
+        assert events == []
+
+    def test_window_and_version_boundary_coexist(self):
+        # 版本切换 + 停运窗口双重边界并存
+        events = detect_versioned_events([
+            r(0, 9.0),     # v1 超限
+            r(10, 5.0),    # v1 恢复
+            r(20, 99.0),   # 窗口内（即便 v2 已生效也忽略）
+            r(30, 9.5),    # v2 下、窗口外：新事件
+            r(40, 5.0),
+        ], [rv(1, 0), rv(2, 15)], [self.w(15, 30)])
+        assert len(events) == 2
+        assert [e["rule_version"] for e in events] == [1, 2]
+        assert events[0]["end_time"] == BASE + timedelta(minutes=10)
+        assert events[1]["start_time"] == BASE + timedelta(minutes=30)

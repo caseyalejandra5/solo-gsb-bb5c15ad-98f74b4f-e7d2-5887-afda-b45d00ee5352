@@ -8,13 +8,21 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Query
 
 from . import database as db
-from .events import Reading, Rule, RuleVersion, detect_versioned_events
+from .events import (
+    OutageWindow,
+    Reading,
+    Rule,
+    RuleVersion,
+    detect_versioned_events,
+)
 from .schemas import (
     DeviceRule,
     DeviceRuleIn,
     DeviceRuleVersionOut,
     EventOut,
     IngestResult,
+    OutageWindowBatchIn,
+    OutageWindowOut,
     ReadingBatchIn,
     ReadingOut,
     to_utc,
@@ -29,12 +37,15 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Cold Chain Temperature Event API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "接收设备按时间上报的温度读数，按每个设备配置的上下限与容忍时长"
         "识别连续超温事件，返回事件起止时间、峰值与累计超限时长。"
         "规则支持多版本：更新时可指定 effective_at，查询事件时对每条读数"
         "应用当时已生效的规则版本，版本切换点强制结束旧事件。"
+        "设备可配置计划停运窗口（UTC 半开区间 [start,end)）：窗口内读数"
+        "不参与判定，窗口边界强制闭合既有事件并清空恢复/容忍状态，"
+        "窗口前后的超限不合并，窗口结束后的首条超限可开启新事件。"
     ),
     lifespan=lifespan,
 )
@@ -184,7 +195,14 @@ def _events_for_device(device_id: str,
         Reading(ts=to_utc(datetime.fromisoformat(r["ts"])), temperature=r["temperature"])
         for r in rows
     ]
-    events = detect_versioned_events(readings, versions)
+    windows = [
+        OutageWindow(
+            start=to_utc(datetime.fromisoformat(s)),
+            end=to_utc(datetime.fromisoformat(e)),
+        )
+        for s, e in db.fetch_outage_windows(device_id)
+    ]
+    events = detect_versioned_events(readings, versions, windows)
 
     start_utc = to_utc(start) if start else None
     end_utc = to_utc(end) if end else None
@@ -220,3 +238,54 @@ def all_events(
         result.extend(_events_for_device(rule["device_id"], start, end))
     result.sort(key=lambda e: (e.start_time, e.device_id))
     return result
+
+
+# ---------- 计划停运窗口 ----------
+
+@app.post(
+    "/api/v1/outage-windows",
+    response_model=list[OutageWindowOut],
+    status_code=201,
+)
+def create_outage_windows(batch: OutageWindowBatchIn):
+    """批量创建设备计划停运窗口。
+
+    窗口使用 UTC 半开区间 [start, end)：start 时刻属于窗口，end 时刻不属于。
+    同一设备重叠或首尾相接的窗口（含与库中既有窗口）持久化为合并后的区间；
+    不同设备的窗口互不影响。返回受影响设备持久化后的全部窗口。
+    """
+    rows = [
+        (w.device_id, w.start, w.end, w.note)
+        for w in batch.windows
+    ]
+    return db.add_outage_windows(rows)
+
+
+@app.get("/api/v1/outage-windows", response_model=list[OutageWindowOut])
+def list_all_outage_windows(
+    start: datetime | None = Query(None, description="起始时间（含），ISO 8601"),
+    end: datetime | None = Query(None, description="结束时间（不含），ISO 8601"),
+):
+    """按时间范围查询全部设备的计划停运窗口（与 [start, end) 有交集即返回）。"""
+    return db.list_outage_windows(
+        None,
+        to_utc(start).isoformat() if start else None,
+        to_utc(end).isoformat() if end else None,
+    )
+
+
+@app.get(
+    "/api/v1/devices/{device_id}/outage-windows",
+    response_model=list[OutageWindowOut],
+)
+def list_device_outage_windows(
+    device_id: str,
+    start: datetime | None = Query(None, description="起始时间（含），ISO 8601"),
+    end: datetime | None = Query(None, description="结束时间（不含），ISO 8601"),
+):
+    """按时间范围查询单个设备的计划停运窗口（与 [start, end) 有交集即返回）。"""
+    return db.list_outage_windows(
+        device_id,
+        to_utc(start).isoformat() if start else None,
+        to_utc(end).isoformat() if end else None,
+    )

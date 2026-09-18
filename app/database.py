@@ -42,6 +42,18 @@ CREATE TABLE IF NOT EXISTS readings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_readings_device_ts ON readings (device_id, ts);
+
+CREATE TABLE IF NOT EXISTS device_outage_windows (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   TEXT NOT NULL,
+    start_ts    TEXT NOT NULL,          -- ISO 8601, 统一存 UTC，半开区间 [start_ts, end_ts)
+    end_ts      TEXT NOT NULL,
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_outage_windows_device_ts
+    ON device_outage_windows (device_id, start_ts, end_ts);
 """
 
 
@@ -227,12 +239,15 @@ def list_rules() -> list[dict]:
 
 
 def delete_device(device_id: str) -> bool:
-    """删除设备的全部规则版本及其全部读数，返回设备是否存在过。"""
+    """删除设备的全部规则版本、停运窗口及其全部读数，返回设备是否存在过。"""
     with _connect() as conn:
         cur = conn.execute(
             "DELETE FROM device_rule_versions WHERE device_id = ?", (device_id,)
         )
         conn.execute("DELETE FROM readings WHERE device_id = ?", (device_id,))
+        conn.execute(
+            "DELETE FROM device_outage_windows WHERE device_id = ?", (device_id,)
+        )
         return cur.rowcount > 0
 
 
@@ -289,3 +304,148 @@ def list_device_ids_with_readings() -> list[str]:
     with _connect() as conn:
         rows = conn.execute("SELECT DISTINCT device_id FROM readings").fetchall()
     return [r["device_id"] for r in rows]
+
+
+# ---------- 计划停运窗口 ----------
+
+def _merge_window_rows(rows: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    """合并 (start_iso, end_iso, note) 列表中重叠或首尾相接的区间。
+
+    半开区间 [a_start, a_end) 与 [b_start, b_end)（a_start <= b_start）
+    在 b_start <= a_end 时合并；合并行的备注去重后用 "; " 连接。
+    """
+    ordered = sorted(rows, key=lambda x: x[0])
+    merged: list[tuple[str, str, str]] = []
+    for start_iso, end_iso, note in ordered:
+        if merged and start_iso <= merged[-1][1]:
+            prev_start, prev_end, prev_note = merged[-1]
+            end_iso = max(prev_end, end_iso)
+            notes = [n for n in prev_note.split("; ") if n]
+            if note and note not in notes:
+                notes.append(note)
+            merged[-1] = (prev_start, end_iso, "; ".join(notes))
+        else:
+            merged.append((start_iso, end_iso, note))
+    return merged
+
+
+def add_outage_windows(
+    windows: list[tuple[str, datetime, datetime, str]],
+) -> list[dict]:
+    """批量创建设备计划停运窗口，按设备持久化为合并后的区间。
+
+    windows: [(device_id, start, end, note), ...]，start/end 为 UTC datetime，
+    窗口使用半开区间 [start, end)。同一设备重叠或首尾相接的窗口（包括与库中
+    既有窗口）合并为一个区间；不同设备的窗口互不影响。
+    返回受影响设备最终持久化的全部窗口（按设备、开始时间升序）。
+    """
+    by_device: dict[str, list[tuple[str, str, str]]] = {}
+    for device_id, start, end, note in windows:
+        start_iso = start.astimezone(timezone.utc).isoformat()
+        end_iso = end.astimezone(timezone.utc).isoformat()
+        by_device.setdefault(device_id, []).append((start_iso, end_iso, note))
+
+    affected = sorted(by_device)
+    now = utcnow_iso()
+    with _connect() as conn:
+        for device_id in affected:
+            new_rows = _merge_window_rows(by_device[device_id])
+            lo, hi = new_rows[0][0], new_rows[-1][1]
+            # 定点扩展：合并既有窗口后可能继续触碰到更外侧的既有窗口，
+            # 反复扩大选择范围直到合并结果不再变化
+            merged = new_rows
+            while True:
+                existing = conn.execute(
+                    """
+                    SELECT start_ts, end_ts, note FROM device_outage_windows
+                    WHERE device_id = ? AND start_ts <= ? AND end_ts >= ?
+                    ORDER BY start_ts
+                    """,
+                    (device_id, hi, lo),
+                ).fetchall()
+                candidate = _merge_window_rows(
+                    new_rows
+                    + [(r["start_ts"], r["end_ts"], r["note"]) for r in existing]
+                )
+                next_lo, next_hi = candidate[0][0], candidate[-1][1]
+                if (next_lo, next_hi) == (lo, hi):
+                    merged = candidate
+                    break
+                lo, hi = next_lo, next_hi
+            conn.execute(
+                """
+                DELETE FROM device_outage_windows
+                WHERE device_id = ? AND start_ts <= ? AND end_ts >= ?
+                """,
+                (device_id, hi, lo),
+            )
+            conn.executemany(
+                """
+                INSERT INTO device_outage_windows
+                    (device_id, start_ts, end_ts, note, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [(device_id, s, e, n, now) for s, e, n in merged],
+            )
+        return _fetch_outage_windows(conn, affected)
+
+
+def _fetch_outage_windows(
+    conn: sqlite3.Connection, device_ids: list[str]
+) -> list[dict]:
+    if not device_ids:
+        return []
+    placeholders = ", ".join("?" for _ in device_ids)
+    rows = conn.execute(
+        f"""
+        SELECT id, device_id, start_ts AS start, end_ts AS end, note, created_at
+        FROM device_outage_windows
+        WHERE device_id IN ({placeholders})
+        ORDER BY device_id, start_ts
+        """,
+        device_ids,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_outage_windows(
+    device_id: str | None = None,
+    start_iso: str | None = None,
+    end_iso: str | None = None,
+) -> list[dict]:
+    """查询停运窗口（可按设备、时间范围过滤），按设备、开始时间升序。
+
+    时间范围按半开重叠匹配：窗口与查询区间 [start, end) 有交集即返回
+    （窗口 start < 查询 end 且 窗口 end > 查询 start）。
+    """
+    sql = (
+        "SELECT id, device_id, start_ts AS start, end_ts AS end, note, created_at "
+        "FROM device_outage_windows WHERE 1=1"
+    )
+    params: list = []
+    if device_id is not None:
+        sql += " AND device_id = ?"
+        params.append(device_id)
+    if start_iso is not None:
+        sql += " AND end_ts > ?"
+        params.append(start_iso)
+    if end_iso is not None:
+        sql += " AND start_ts < ?"
+        params.append(end_iso)
+    sql += " ORDER BY device_id, start_ts"
+    with _connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def fetch_outage_windows(device_id: str) -> list[tuple[str, str]]:
+    """取某设备的全部停运窗口 [(start_iso, end_iso), ...]，按开始时间升序。"""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT start_ts, end_ts FROM device_outage_windows
+            WHERE device_id = ? ORDER BY start_ts
+            """,
+            (device_id,),
+        ).fetchall()
+    return [(r["start_ts"], r["end_ts"]) for r in rows]

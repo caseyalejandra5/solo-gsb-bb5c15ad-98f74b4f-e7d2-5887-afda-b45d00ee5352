@@ -14,12 +14,19 @@
 - 规则版本切换点必须切断旧事件：切换点两侧的读数分别独立识别，
   禁止跨版本合并（短暂恢复、容忍时长均不能跨越版本边界）。
 
+计划停运窗口机制：
+- 窗口为 UTC 半开区间 [start, end)：start 时刻属于窗口，end 时刻不属于；
+- 窗口内的读数不参与任何判定（既不算超限也不算恢复，直接忽略）；
+- 窗口边界是硬边界：必须闭合窗口前的既有事件，并清空恢复/容忍状态，
+  窗口前后的超限即使温度连续、间隔未超过 max_gap 也不得合并；
+- 窗口结束后（end 时刻起）的首条超限可开启全新事件。
+
 时长口径（基于离散采样点的区间归属近似）：
 - 事件起点 = 首个超限读数时间；
 - 事件终点 = 最后一次超限之后首个恢复正常读数的时间；
   若之后没有读数（事件仍在持续），终点 = 最后超限读数时间且 ongoing=True；
 - violation_seconds（累计超限时长）= 事件窗口内，凡左端点超限的
-  相邻读数区间长度之和。
+  相邻读数区间长度之和；跨越版本或停运窗口边界的区间不计入任何一侧。
 """
 
 from __future__ import annotations
@@ -50,6 +57,43 @@ class RuleVersion:
     version: int
     effective_at: datetime
     rule: Rule
+
+
+@dataclass(frozen=True)
+class OutageWindow:
+    """计划停运窗口：UTC 半开区间 [start, end)。"""
+
+    start: datetime
+    end: datetime
+
+    def __post_init__(self) -> None:
+        if self.start >= self.end:
+            raise ValueError("停运窗口要求 start < end")
+
+
+def merge_windows(windows: list[OutageWindow]) -> list[OutageWindow]:
+    """合并同一设备重叠或首尾相接的窗口，按开始时间升序返回。
+
+    两个半开区间 [a_start, a_end) 与 [b_start, b_end)（a_start <= b_start）
+    在 b_start <= a_end 时合并（首尾相接 b_start == a_end 也合并）。
+    """
+    ordered = sorted(windows, key=lambda w: w.start)
+    merged: list[OutageWindow] = []
+    for w in ordered:
+        if merged and w.start <= merged[-1].end:
+            merged[-1] = OutageWindow(
+                merged[-1].start, max(merged[-1].end, w.end)
+            )
+        else:
+            merged.append(w)
+    return merged
+
+
+def in_any_window(ts: datetime, windows: list[OutageWindow]) -> bool:
+    """ts 是否落在任一窗口的半开区间 [start, end) 内。"""
+    starts = [w.start for w in windows]
+    i = bisect_right(starts, ts) - 1
+    return i >= 0 and ts < windows[i].end
 
 
 def is_violation(temperature: float, rule: Rule) -> bool:
@@ -167,25 +211,33 @@ def rule_at(ts: datetime, versions: list[RuleVersion]) -> RuleVersion | None:
 
 
 def detect_versioned_events(
-    readings: list[Reading], versions: list[RuleVersion]
+    readings: list[Reading],
+    versions: list[RuleVersion],
+    windows: list[OutageWindow] | None = None,
 ) -> list[dict]:
-    """按规则版本识别事件。
+    """按规则版本识别事件，计划停运窗口内的读数不参与判定。
 
     对每条读数应用当时已生效的最新版本；版本切换点强制结束旧事件，
     切换点两侧分别用各自版本独立识别，禁止跨版本合并。
+    停运窗口 [start, end) 内的读数直接忽略；窗口边界同样是硬边界：
+    窗口前的既有事件在边界处闭合，恢复/容忍状态清空，窗口前后的超限
+    绝不合并，窗口结束后的首条超限可开启新事件。
     早于首个版本生效时间的读数没有适用规则，直接忽略。
     返回的每个事件带有 rule_version 与 rule_effective_at。
     """
     ordered_versions = sorted(versions, key=lambda v: v.effective_at)
     effective_times = [v.effective_at for v in ordered_versions]
+    ordered_windows = merge_windows(list(windows or []))
+    window_starts = [w.start for w in ordered_windows]
     ordered = sorted(readings, key=lambda r: r.ts)
 
     events: list[dict] = []
-    block: list[Reading] = []          # 当前版本连续片段内的读数
+    block: list[Reading] = []          # 当前版本+窗口片段内的读数
     current_version: RuleVersion | None = None
+    current_segment: int | None = None
 
     def _flush() -> None:
-        # 版本切换是硬边界：旧片段的事件到此为止，绝不与新版本合并
+        # 版本切换 / 停运窗口都是硬边界：旧片段的事件到此为止，绝不跨边界合并
         if block and current_version is not None:
             for ev in detect_events(block, current_version.rule):
                 ev["rule_version"] = current_version.version
@@ -193,15 +245,29 @@ def detect_versioned_events(
                 events.append(ev)
 
     for r in ordered:
+        if in_any_window(r.ts, ordered_windows):
+            # 窗口内读数不参与判定：先闭合窗口前的片段，窗口结束后另起片段
+            _flush()
+            block = []
+            current_version = None
+            current_segment = None
+            continue
         idx = bisect_right(effective_times, r.ts) - 1
         if idx < 0:
             # 首个版本生效之前的读数：无适用规则
             continue
         rv = ordered_versions[idx]
-        if current_version is not None and rv is not current_version:
+        # 窗口把时间轴切成互不相邻的片段（窗口前 / 各窗口之间 / 最后窗口后）；
+        # 片段编号 = 开始时间严格早于该读数的窗口数量
+        segment = bisect_right(window_starts, r.ts)
+        if (
+            current_version is not None
+            and (rv is not current_version or segment != current_segment)
+        ):
             _flush()
             block = []
         current_version = rv
+        current_segment = segment
         block.append(r)
 
     _flush()
