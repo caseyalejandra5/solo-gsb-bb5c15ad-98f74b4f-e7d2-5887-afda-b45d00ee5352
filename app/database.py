@@ -42,6 +42,18 @@ CREATE TABLE IF NOT EXISTS readings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_readings_device_ts ON readings (device_id, ts);
+
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   TEXT NOT NULL,
+    start_ts    TEXT NOT NULL,          -- ISO 8601, 统一存 UTC，半开区间 [start, end)
+    end_ts      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE (device_id, start_ts, end_ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_device_ts
+    ON maintenance_windows (device_id, start_ts, end_ts);
 """
 
 
@@ -227,12 +239,13 @@ def list_rules() -> list[dict]:
 
 
 def delete_device(device_id: str) -> bool:
-    """删除设备的全部规则版本及其全部读数，返回设备是否存在过。"""
+    """删除设备的全部规则版本、计划停运窗口及其全部读数，返回设备是否存在过。"""
     with _connect() as conn:
         cur = conn.execute(
             "DELETE FROM device_rule_versions WHERE device_id = ?", (device_id,)
         )
         conn.execute("DELETE FROM readings WHERE device_id = ?", (device_id,))
+        conn.execute("DELETE FROM maintenance_windows WHERE device_id = ?", (device_id,))
         return cur.rowcount > 0
 
 
@@ -289,3 +302,132 @@ def list_device_ids_with_readings() -> list[str]:
     with _connect() as conn:
         rows = conn.execute("SELECT DISTINCT device_id FROM readings").fetchall()
     return [r["device_id"] for r in rows]
+
+
+# ---------- 设备计划停运窗口 ----------
+
+def merge_intervals(
+    intervals: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """合并重叠或首尾相接的区间（半开 [start, end)），按起点升序返回。"""
+    ordered = sorted(intervals, key=lambda iv: iv[0])
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in ordered:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        elif end > merged[-1][1]:
+            # 与上一区间重叠（start < prev_end）或首尾相接（start == prev_end）
+            merged[-1] = (merged[-1][0], end)
+    return merged
+
+
+def upsert_maintenance_windows(
+    windows_by_device: dict[str, list[tuple[datetime, datetime]]],
+) -> dict[str, list[dict]]:
+    """批量写入各设备的计划停运窗口。
+
+    同一设备已持久化的窗口与新提交的窗口一并合并：重叠或首尾相接
+    （半开语义下相邻：[a,b) 与 [b,c)）的区间合并为一个区间后落库。
+    返回各设备合并后的窗口列表（按起点升序）。
+    """
+    result: dict[str, list[dict]] = {}
+    now = utcnow_iso()
+    with _connect() as conn:
+        for device_id, intervals in windows_by_device.items():
+            existing_rows = conn.execute(
+                "SELECT start_ts, end_ts FROM maintenance_windows "
+                "WHERE device_id = ?",
+                (device_id,),
+            ).fetchall()
+            all_intervals = [
+                (
+                    datetime.fromisoformat(row["start_ts"]),
+                    datetime.fromisoformat(row["end_ts"]),
+                )
+                for row in existing_rows
+            ]
+            all_intervals.extend(
+                (start.astimezone(timezone.utc), end.astimezone(timezone.utc))
+                for start, end in intervals
+            )
+            merged = merge_intervals(all_intervals)
+            conn.execute(
+                "DELETE FROM maintenance_windows WHERE device_id = ?",
+                (device_id,),
+            )
+            conn.executemany(
+                """
+                INSERT INTO maintenance_windows (device_id, start_ts, end_ts, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (device_id, start.isoformat(), end.isoformat(), now)
+                    for start, end in merged
+                ],
+            )
+            result[device_id] = [
+                {
+                    "device_id": device_id,
+                    "start_ts": start.isoformat(),
+                    "end_ts": end.isoformat(),
+                    "created_at": now,
+                }
+                for start, end in merged
+            ]
+    return result
+
+
+def _rows_to_windows(rows: list[sqlite3.Row]) -> list[dict]:
+    return [
+        {
+            "device_id": row["device_id"],
+            "start_ts": row["start_ts"],
+            "end_ts": row["end_ts"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def list_maintenance_windows(
+    device_id: str,
+    start_iso: str | None = None,
+    end_iso: str | None = None,
+) -> list[dict]:
+    """按时间范围查询单设备停运窗口（半开区间相交即命中），按起点升序。"""
+    sql = "SELECT device_id, start_ts, end_ts, created_at FROM maintenance_windows WHERE device_id = ?"
+    params: list = [device_id]
+    if start_iso is not None:
+        # 与查询区间 [start, end) 相交：w.end > q.start
+        sql += " AND end_ts > ?"
+        params.append(start_iso)
+    if end_iso is not None:
+        # w.start < q.end
+        sql += " AND start_ts < ?"
+        params.append(end_iso)
+    sql += " ORDER BY start_ts"
+    with _connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return _rows_to_windows(rows)
+
+
+def list_all_maintenance_windows(
+    start_iso: str | None = None,
+    end_iso: str | None = None,
+) -> list[dict]:
+    """按时间范围查询全部设备的停运窗口（半开区间相交即命中）。"""
+    sql = (
+        "SELECT device_id, start_ts, end_ts, created_at "
+        "FROM maintenance_windows WHERE 1=1"
+    )
+    params: list = []
+    if start_iso is not None:
+        sql += " AND end_ts > ?"
+        params.append(start_iso)
+    if end_iso is not None:
+        sql += " AND start_ts < ?"
+        params.append(end_iso)
+    sql += " ORDER BY start_ts, device_id"
+    with _connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return _rows_to_windows(rows)

@@ -87,6 +87,41 @@ class IngestResult(BaseModel):
     inserted: int
 
 
+class MaintenanceWindowIn(BaseModel):
+    device_id: str = Field(..., min_length=1)
+    start: datetime = Field(..., description="停运窗口起点（含），ISO 8601，无时区按 UTC")
+    end: datetime = Field(..., description="停运窗口终点（不含），ISO 8601，无时区按 UTC")
+
+    @field_validator("start", "end")
+    @classmethod
+    def _normalize_ts(cls, v: datetime) -> datetime:
+        return to_utc(v)
+
+    @model_validator(mode="after")
+    def _check_half_open(self):
+        if self.end <= self.start:
+            raise ValueError("end 必须晚于 start（半开区间 [start, end)）")
+        return self
+
+
+class MaintenanceWindowBatchIn(BaseModel):
+    windows: list[MaintenanceWindowIn] = Field(..., min_length=1, max_length=10000)
+
+
+class MaintenanceWindowOut(BaseModel):
+    device_id: str
+    start: datetime = Field(..., description="窗口起点（含，UTC）")
+    end: datetime = Field(..., description="窗口终点（不含，UTC）")
+    created_at: datetime
+
+
+class MaintenanceWindowBatchResult(BaseModel):
+    """批量创建结果：各设备与既有窗口合并后的窗口列表。"""
+
+    windows: list[MaintenanceWindowOut]
+    devices: int = Field(..., description="本次涉及的设备数")
+
+
 class ReadingOut(BaseModel):
     device_id: str
     ts: datetime

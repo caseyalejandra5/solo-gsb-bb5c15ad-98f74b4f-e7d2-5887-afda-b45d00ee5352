@@ -45,6 +45,19 @@ def _send_readings(client, device_id, points):
     return client.post("/api/v1/readings", json={"readings": readings})
 
 
+def _put_windows(client, entries):
+    """entries: [(device_id, 起点分钟, 终点分钟), ...]"""
+    windows = [
+        {
+            "device_id": device_id,
+            "start": (BASE + timedelta(minutes=s)).isoformat(),
+            "end": (BASE + timedelta(minutes=e)).isoformat(),
+        }
+        for device_id, s, e in entries
+    ]
+    return client.post("/api/v1/maintenance-windows", json={"windows": windows})
+
+
 class TestRuleApi:
     def test_put_and_get_rule(self, client):
         resp = _put_rule(client, "truck-01")
@@ -280,3 +293,170 @@ class TestRuleVersions:
         assert len(events) == 1
         assert events[0]["rule_version"] == 2
 
+
+
+class TestMaintenanceWindowsApi:
+    def test_batch_create_returns_merged_windows(self, client):
+        resp = _put_windows(client, [
+            ("truck-01", 0, 30),
+            ("truck-01", 20, 60),     # 与前者重叠 → 合并为 [0,60)
+            ("truck-01", 60, 90),     # 与 [0,60) 首尾相接 → 再合并为 [0,90)
+            ("truck-02", 100, 120),
+        ])
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body["devices"] == 2
+        t1 = [w for w in body["windows"] if w["device_id"] == "truck-01"]
+        assert len(t1) == 1
+        assert t1[0]["start"].startswith("2026-01-01T00:00:00")
+        assert t1[0]["end"].startswith("2026-01-01T01:30:00")
+        t2 = [w for w in body["windows"] if w["device_id"] == "truck-02"]
+        assert len(t2) == 1
+
+    def test_touching_intervals_merge_on_persistence(self, client):
+        # 分两次提交，第二次的窗口与已持久化窗口首尾相接 → 合并
+        assert _put_windows(client, [("truck-01", 0, 30)]).status_code == 201
+        resp = _put_windows(client, [("truck-01", 30, 60)])
+        saved = resp.json()["windows"]
+        assert len(saved) == 1
+        assert saved[0]["end"].startswith("2026-01-01T01:00:00")
+
+    def test_disjoint_windows_remain_separate(self, client):
+        resp = _put_windows(client, [
+            ("truck-01", 0, 10),
+            ("truck-01", 20, 30),     # [0,10) 与 [20,30) 不相交、不相接
+        ])
+        saved = resp.json()["windows"]
+        assert len(saved) == 2
+
+    def test_invalid_window_rejected(self, client):
+        # end <= start → 422
+        resp = client.post("/api/v1/maintenance-windows", json={"windows": [
+            {"device_id": "truck-01",
+             "start": (BASE + timedelta(minutes=30)).isoformat(),
+             "end": (BASE + timedelta(minutes=30)).isoformat()},
+        ]})
+        assert resp.status_code == 422
+
+    def test_naive_timestamp_treated_as_utc(self, client):
+        resp = client.post("/api/v1/maintenance-windows", json={"windows": [
+            {"device_id": "truck-01",
+             "start": "2026-01-01T00:00:00",
+             "end": "2026-01-01T00:30:00"},
+        ]})
+        assert resp.status_code == 201
+        start = resp.json()["windows"][0]["start"]
+        assert start.startswith("2026-01-01T00:00:00")
+        assert start.endswith(("Z", "+00:00"))
+
+    def test_query_windows_all_devices_half_open_overlap(self, client):
+        _put_windows(client, [
+            ("truck-01", 0, 30),
+            ("truck-01", 60, 90),
+            ("truck-02", 20, 40),
+        ])
+        # 查 [40, 60)：[0,30)、[60,90)、[20,40) 均只在端点相接，
+        # 半开区间下不相交 → 空结果
+        resp = client.get("/api/v1/maintenance-windows", params={
+            "start": (BASE + timedelta(minutes=40)).isoformat(),
+            "end": (BASE + timedelta(minutes=60)).isoformat(),
+        })
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+        # 查 [25, 60)：[0,30) 与 [20,40) 相交，[60,90) 端点相接不算相交
+        resp = client.get("/api/v1/maintenance-windows", params={
+            "start": (BASE + timedelta(minutes=25)).isoformat(),
+            "end": (BASE + timedelta(minutes=60)).isoformat(),
+        })
+        rows = resp.json()
+        assert {(w["device_id"], w["start"][11:16]) for w in rows} == {
+            ("truck-01", "00:00"), ("truck-02", "00:20")}
+
+    def test_query_windows_per_device(self, client):
+        _put_windows(client, [
+            ("truck-01", 0, 30),
+            ("truck-02", 0, 30),
+        ])
+        rows = client.get(
+            "/api/v1/devices/truck-01/maintenance-windows"
+        ).json()
+        assert {w["device_id"] for w in rows} == {"truck-01"}
+
+    def test_window_excludes_inside_readings_from_events(self, client):
+        _put_rule(client, "truck-01")
+        _put_windows(client, [("truck-01", 10, 30)])
+        _send_readings(client, "truck-01", [
+            (0, 5.0),
+            (10, 99.0),   # 窗口起点（含）：忽略
+            (20, 99.0),   # 窗口内：忽略
+            (30, 5.0),    # 窗口终点（不含）：正常读数
+        ])
+        assert client.get("/api/v1/devices/truck-01/events").json() == []
+
+    def test_cross_window_violations_split_into_two_events(self, client):
+        _put_rule(client, "truck-01")
+        _put_windows(client, [("truck-01", 10, 20)])
+        _send_readings(client, "truck-01", [
+            (0, 9.0),
+            (8, 9.5),     # 窗口前最后超限
+            (10, 99.0),   # 窗口内，忽略
+            (15, 99.0),   # 窗口内，忽略
+            (20, 9.2),    # 窗口终点参与判定：新事件起点
+            (30, 5.0),
+        ])
+        events = client.get("/api/v1/devices/truck-01/events").json()
+        assert len(events) == 2
+        assert events[0]["end_time"].startswith("2026-01-01T00:08")
+        assert events[0]["ongoing"] is True
+        assert events[1]["start_time"].startswith("2026-01-01T00:20")
+        assert events[1]["end_time"].startswith("2026-01-01T00:30")
+        # 旧事件超限区间只有 0→8（8 分钟）；新事件只有 20→30（10 分钟）
+        assert events[0]["violation_seconds"] == 8 * 60
+        assert events[1]["violation_seconds"] == 10 * 60
+
+    def test_window_with_no_inside_reading_still_closes_event(self, client):
+        _put_rule(client, "truck-01")
+        _put_windows(client, [("truck-01", 10, 20)])
+        _send_readings(client, "truck-01", [
+            (0, 9.0),
+            (5, 9.0),
+            (25, 9.0),     # 窗口 [10,20) 内无任何读数，边界仍强制分段
+            (35, 5.0),
+        ])
+        events = client.get("/api/v1/devices/truck-01/events").json()
+        assert len(events) == 2
+        assert events[0]["end_time"].startswith("2026-01-01T00:05")
+        assert events[1]["start_time"].startswith("2026-01-01T00:25")
+
+    def test_window_clears_tolerance_for_all_devices_endpoint(self, client):
+        _put_rule(client, "truck-01")
+        _put_rule(client, "truck-02")
+        _put_windows(client, [("truck-01", 4, 6), ("truck-02", 4, 6)])
+        # 无窗口时恢复 4 分钟 < 容忍 5 分钟会合并；窗口必须切开
+        for device in ("truck-01", "truck-02"):
+            _send_readings(client, device, [
+                (0, 9.0),
+                (2, 5.0),
+                (4, 99.0),
+                (6, 9.0),
+                (10, 5.0),
+            ])
+        events = client.get("/api/v1/events").json()
+        assert len(events) == 4
+        per_device = {}
+        for ev in events:
+            per_device.setdefault(ev["device_id"], []).append(ev)
+        for device, evs in per_device.items():
+            assert len(evs) == 2, device
+            assert evs[0]["end_time"].startswith("2026-01-01T00:02")
+            assert evs[1]["start_time"].startswith("2026-01-01T00:06")
+
+    def test_delete_device_removes_windows(self, client):
+        _put_rule(client, "truck-01")
+        _put_windows(client, [("truck-01", 0, 30)])
+        assert client.delete("/api/v1/devices/truck-01").status_code == 200
+        rows = client.get(
+            "/api/v1/devices/truck-01/maintenance-windows"
+        ).json()
+        assert rows == []

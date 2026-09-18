@@ -2,11 +2,27 @@
 
 from datetime import datetime, timedelta, timezone
 
-from app.events import Reading, Rule, RuleVersion, detect_events, detect_versioned_events
+from app.events import (
+    MaintenanceWindow,
+    Reading,
+    Rule,
+    RuleVersion,
+    detect_events,
+    detect_versioned_events,
+    in_window,
+    split_by_windows,
+)
 
 BASE = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 # 上限 8℃、下限 2℃、容忍 5 分钟、最大间隔 30 分钟
 RULE = Rule(upper_limit=8.0, lower_limit=2.0, tolerance_seconds=300, max_gap_seconds=1800)
+
+
+def w(start_minutes: float, end_minutes: float) -> MaintenanceWindow:
+    return MaintenanceWindow(
+        start=BASE + timedelta(minutes=start_minutes),
+        end=BASE + timedelta(minutes=end_minutes),
+    )
 
 
 def rv(version: int, effective_minutes: float, rule: Rule = RULE) -> RuleVersion:
@@ -247,3 +263,121 @@ class TestVersionedEvents:
 
     def test_no_versions_no_events(self):
         assert detect_versioned_events([r(0, 9.0)], []) == []
+
+
+class TestMaintenanceWindows:
+    def test_half_open_boundary_membership(self):
+        win = [w(10, 20)]
+        assert in_window(BASE + timedelta(minutes=10), win) is True   # start 含
+        assert in_window(BASE + timedelta(minutes=15), win) is True
+        assert in_window(BASE + timedelta(minutes=20), win) is False  # end 不含
+        assert in_window(BASE + timedelta(minutes=5), win) is False
+
+    def test_split_drops_in_window_readings_and_segments(self):
+        fragments = split_by_windows(
+            [r(0, 9.0), r(10, 99.0), r(15, 99.0), r(20, 9.0)],
+            [w(10, 20)],
+        )
+        assert fragments == [[r(0, 9.0)], [r(20, 9.0)]]
+
+    def test_readings_inside_window_are_ignored(self):
+        # 窗口内即便有“超限”读数也不产生事件
+        events = detect_versioned_events([
+            r(0, 5.0),
+            r(10, 99.0),  # 窗口内，忽略
+            r(15, 99.0),  # 窗口内，忽略
+            r(20, 5.0),
+        ], [rv(1, -1000)], [w(10, 20)])
+        assert events == []
+
+    def test_boundary_times_start_inclusive_end_exclusive(self):
+        # 读数恰好在 start（10）→ 窗口内忽略；恰好在 end（20）→ 参与判定
+        events = detect_versioned_events([
+            r(10, 99.0),  # 窗口起点：忽略
+            r(20, 9.0),   # 窗口终点：窗口外，算超限并开启事件
+            r(30, 5.0),
+        ], [rv(1, -1000)], [w(10, 20)])
+        assert len(events) == 1
+        assert events[0]["start_time"] == BASE + timedelta(minutes=20)
+        assert events[0]["end_time"] == BASE + timedelta(minutes=30)
+
+    def test_cross_window_violations_never_merge(self):
+        # 窗口前后都在超限，且时间间隔很短（远小于容忍/max_gap）：必须切成两个事件
+        events = detect_versioned_events([
+            r(0, 9.0),
+            r(8, 9.5),    # 窗口前最后超限
+            r(10, 99.0),  # 窗口内，忽略
+            r(12, 99.0),  # 窗口内，忽略
+            r(14, 9.2),   # 窗口后首条超限 → 新事件
+            r(20, 5.0),
+        ], [rv(1, -1000)], [w(10, 14)])
+        assert len(events) == 2
+        before, after = events
+        # 窗口边界闭合旧事件：无后续恢复读数，ongoing=True，终点为最后超限时间
+        assert before["start_time"] == BASE
+        assert before["end_time"] == BASE + timedelta(minutes=8)
+        assert before["ongoing"] is True
+        assert before["violation_seconds"] == 8 * 60
+        assert after["start_time"] == BASE + timedelta(minutes=14)
+        assert after["end_time"] == BASE + timedelta(minutes=20)
+        assert after["ongoing"] is False
+        assert after["violation_seconds"] == 6 * 60
+
+    def test_window_closes_event_even_without_reading_at_boundary(self):
+        # 窗口前后没有恰好在边界上的读数，边界仍强制闭合
+        events = detect_versioned_events([
+            r(0, 9.0),
+            r(5, 9.0),
+            r(18, 9.0),
+            r(25, 5.0),
+        ], [rv(1, -1000)], [w(10, 15)])
+        assert len(events) == 2
+        assert events[0]["end_time"] == BASE + timedelta(minutes=5)
+        assert events[0]["ongoing"] is True
+        assert events[1]["start_time"] == BASE + timedelta(minutes=18)
+
+    def test_window_clears_recovery_tolerance_state(self):
+        # 窗口前已短暂恢复；窗口清空容忍状态后，窗口结束后的首条超限是新事件。
+        # 无窗口时恢复间隔仅 4 分钟（< 容忍 5 分钟）本会合并；
+        # 窗口 [3,5) 把恢复切开（窗口内没有读数，边界本身也强制分段）。
+        events = detect_versioned_events([
+            r(0, 9.0),
+            r(2, 5.0),    # 恢复（窗口前）
+            r(6, 9.0),    # 窗口后首条超限 → 新事件
+            r(10, 5.0),
+        ], [rv(1, -1000)], [w(3, 5)])
+        assert len(events) == 2
+        assert events[0]["start_time"] == BASE
+        assert events[0]["end_time"] == BASE + timedelta(minutes=2)
+        # 窗口前最后一条读数已恢复正常：旧事件在窗口边界闭合，ongoing=False
+        assert events[0]["ongoing"] is False
+        assert events[1]["start_time"] == BASE + timedelta(minutes=6)
+        assert events[1]["end_time"] == BASE + timedelta(minutes=10)
+
+    def test_window_with_in_window_reading_clears_tolerance(self):
+        # 窗口内有读数的情形：0 超限 → 2 恢复 → 4 窗口内读数（忽略）→ 6 再超限。
+        # 若无窗口，恢复时长 4 分钟 < 容忍 5 分钟，会合并；有窗口必须切开。
+        events = detect_versioned_events([
+            r(0, 9.0),
+            r(2, 5.0),
+            r(4, 99.0),  # 窗口内，忽略
+            r(6, 9.0),
+            r(10, 5.0),
+        ], [rv(1, -1000)], [w(4, 6)])
+        assert len(events) == 2
+        assert events[0]["end_time"] == BASE + timedelta(minutes=2)
+        assert events[1]["start_time"] == BASE + timedelta(minutes=6)
+
+    def test_window_plus_version_boundary(self):
+        # 窗口跨越版本切换点：两种硬边界同时存在，仍然只在实际超限片段产生事件
+        events = detect_versioned_events([
+            r(0, 9.0),     # v1 超限
+            r(5, 9.0),     # v1 超限
+            r(20, 99.0),   # v2 窗口内，忽略
+            r(30, 5.0),    # v2 正常
+        ], [rv(1, 0), rv(2, 10)], [w(15, 25)])
+        assert len(events) == 1
+        ev = events[0]
+        assert ev["rule_version"] == 1
+        assert ev["end_time"] == BASE + timedelta(minutes=5)
+        assert ev["ongoing"] is True

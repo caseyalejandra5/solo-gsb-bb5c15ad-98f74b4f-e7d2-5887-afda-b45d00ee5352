@@ -6,15 +6,25 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import RedirectResponse
 
 from . import database as db
-from .events import Reading, Rule, RuleVersion, detect_versioned_events
+from .events import (
+    MaintenanceWindow,
+    Reading,
+    Rule,
+    RuleVersion,
+    detect_versioned_events,
+)
 from .schemas import (
     DeviceRule,
     DeviceRuleIn,
     DeviceRuleVersionOut,
     EventOut,
     IngestResult,
+    MaintenanceWindowBatchIn,
+    MaintenanceWindowBatchResult,
+    MaintenanceWindowOut,
     ReadingBatchIn,
     ReadingOut,
     to_utc,
@@ -29,12 +39,14 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Cold Chain Temperature Event API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "接收设备按时间上报的温度读数，按每个设备配置的上下限与容忍时长"
         "识别连续超温事件，返回事件起止时间、峰值与累计超限时长。"
         "规则支持多版本：更新时可指定 effective_at，查询事件时对每条读数"
         "应用当时已生效的规则版本，版本切换点强制结束旧事件。"
+        "支持设备计划停运窗口（UTC 半开区间 [start, end)）：窗口内读数"
+        "不参与判定，窗口边界强制闭合事件并清空恢复/容忍状态。"
     ),
     lifespan=lifespan,
 )
@@ -43,6 +55,12 @@ app = FastAPI(
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    """根路径直接跳转到 Swagger UI（http://localhost:8000 -> /docs）。"""
+    return RedirectResponse(url="/docs")
 
 
 # ---------- 设备规则配置 ----------
@@ -123,7 +141,7 @@ def list_device_rule_versions(device_id: str):
 
 @app.delete("/api/v1/devices/{device_id}")
 def delete_device(device_id: str):
-    """删除设备的全部规则版本及其全部温度读数。"""
+    """删除设备的全部规则版本、计划停运窗口及其全部温度读数。"""
     if not db.delete_device(device_id):
         raise HTTPException(404, f"设备 {device_id!r} 不存在")
     return {"deleted": device_id}
@@ -157,6 +175,75 @@ def list_readings(
     )
 
 
+# ---------- 计划停运窗口 ----------
+
+def _window_row_to_out(row: dict) -> MaintenanceWindowOut:
+    return MaintenanceWindowOut(
+        device_id=row["device_id"],
+        start=to_utc(datetime.fromisoformat(row["start_ts"])),
+        end=to_utc(datetime.fromisoformat(row["end_ts"])),
+        created_at=to_utc(datetime.fromisoformat(row["created_at"])),
+    )
+
+
+@app.post(
+    "/api/v1/maintenance-windows",
+    response_model=MaintenanceWindowBatchResult,
+    status_code=201,
+)
+def create_maintenance_windows(batch: MaintenanceWindowBatchIn):
+    """批量创建设备计划停运窗口。
+
+    窗口使用 UTC 半开区间 [start, end)：start 时刻在窗口内，end 时刻在窗口外。
+    同一设备重叠或首尾相接（[a,b) 与 [b,c)）的窗口会与既有窗口一并
+    合并为一个区间后持久化，响应返回各设备合并后的窗口列表。
+    """
+    by_device: dict[str, list[tuple[datetime, datetime]]] = {}
+    for w in batch.windows:
+        by_device.setdefault(w.device_id, []).append((w.start, w.end))
+    saved = db.upsert_maintenance_windows(by_device)
+    flattened = [
+        _window_row_to_out(row)
+        for device_id in sorted(saved)
+        for row in saved[device_id]
+    ]
+    return MaintenanceWindowBatchResult(windows=flattened, devices=len(saved))
+
+
+@app.get(
+    "/api/v1/maintenance-windows",
+    response_model=list[MaintenanceWindowOut],
+)
+def list_maintenance_windows(
+    start: datetime | None = Query(None, description="起始时间（含），ISO 8601"),
+    end: datetime | None = Query(None, description="结束时间（不含），ISO 8601"),
+):
+    """按时间范围查询全部设备的停运窗口（区间相交即命中）。"""
+    rows = db.list_all_maintenance_windows(
+        to_utc(start).isoformat() if start else None,
+        to_utc(end).isoformat() if end else None,
+    )
+    return [_window_row_to_out(row) for row in rows]
+
+
+@app.get(
+    "/api/v1/devices/{device_id}/maintenance-windows",
+    response_model=list[MaintenanceWindowOut],
+)
+def list_device_maintenance_windows(
+    device_id: str,
+    start: datetime | None = Query(None, description="起始时间（含），ISO 8601"),
+    end: datetime | None = Query(None, description="结束时间（不含），ISO 8601"),
+):
+    """按时间范围查询单台设备的停运窗口（区间相交即命中）。"""
+    rows = db.list_maintenance_windows(
+        device_id,
+        to_utc(start).isoformat() if start else None,
+        to_utc(end).isoformat() if end else None,
+    )
+    return [_window_row_to_out(row) for row in rows]
+
+
 # ---------- 事件查询 ----------
 
 def _events_for_device(device_id: str,
@@ -184,7 +271,15 @@ def _events_for_device(device_id: str,
         Reading(ts=to_utc(datetime.fromisoformat(r["ts"])), temperature=r["temperature"])
         for r in rows
     ]
-    events = detect_versioned_events(readings, versions)
+    window_rows = db.list_maintenance_windows(device_id)
+    windows = [
+        MaintenanceWindow(
+            start=to_utc(datetime.fromisoformat(w["start_ts"])),
+            end=to_utc(datetime.fromisoformat(w["end_ts"])),
+        )
+        for w in window_rows
+    ]
+    events = detect_versioned_events(readings, versions, windows)
 
     start_utc = to_utc(start) if start else None
     end_utc = to_utc(end) if end else None
