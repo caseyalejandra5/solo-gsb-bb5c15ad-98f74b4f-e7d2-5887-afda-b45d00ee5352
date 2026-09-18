@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    container_name: coldchain-api
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库文件位置（挂在命名卷上，重启不丢数据）
+      - DB_PATH=/data/coldchain.db
+    volumes:
+      - coldchain-data:/data
+    restart: unless-stopped
+
+volumes:
+  coldchain-data:
